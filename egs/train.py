@@ -5,8 +5,11 @@ import pprint
 sys.path.append("../src")
 import argparse
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from criterion.sdr import ClippedNegSISDR, NegSISDR
+# from models.sepformer import SepFormer
+from models.conv_tasnet import ConvTasNet
 from models.tse_sepformer import SepFormer
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.seed import seed_everything
@@ -45,6 +48,7 @@ class System(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         y, x, e = batch["clean_wave"], batch["noisy_wave"], batch["spk_emb"]
+        # y_hat = self.model(x)
         y_hat = self.model(x, e)
         loss = self.loss_func(y_hat, y)
         self.log(
@@ -55,6 +59,7 @@ class System(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         y, x, e = batch["clean_wave"], batch["noisy_wave"], batch["spk_emb"]
+        # y_hat = self.model(x)
         y_hat = self.model(x, e)
         loss = self.loss_func(y_hat, y)
         self.log(
@@ -63,13 +68,13 @@ class System(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = self.optimizer(self.parameters(), lr=self.args.lr)
+        # optimizer = self.optimizer(self.model.parameters(), lr=self.args.lr)
         if self.args.half_lr:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer=optimizer, factor=0.5, patience=5
+                optimizer=self.optimizer, factor=0.5, patience=5
             )
             return {
-                "optimizer": optimizer,
+                "optimizer": self.optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
                     "monitor": "val_loss",
@@ -80,17 +85,11 @@ class System(pl.LightningModule):
                 }
             }
         else:
-            return optimizer
+            return self.optimizer
 
 
 def main(args):
-    if not os.path.exists(args.exp_dir):
-        os.makedirs(args.exp_dir)
-    if not os.path.exists(args.model_dir):
-        os.makedirs(args.model_dir)
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
-
+    
     train_set = PTSEDataset(
         csv_dir=args.train_csv_dir,
         seg_len=args.seg_len,
@@ -130,27 +129,37 @@ def main(args):
         sep_d_ff_intra=args.sep_d_ff_intra, sep_d_ff_inter=args.sep_d_ff_inter,
         sep_norm=args.sep_norm, sep_nonlinear=args.sep_nonlinear, sep_dropout=args.sep_dropout, mask_nonlinear=args.mask_nonlinear,
         causal=args.causal,
-        n_sources=args.n_sources
+        n_sources=args.n_sources,
     )
+    # model = ConvTasNet(
+    #     args.n_basis, args.kernel_size, stride=args.stride, enc_basis=args.enc_basis, dec_basis=args.dec_basis, enc_nonlinear=args.enc_nonlinear,
+    #     window_fn=args.window_fn, enc_onesided=args.enc_onesided, enc_return_complex=args.enc_return_complex,
+    #     sep_hidden_channels=args.sep_hidden_channels, sep_bottleneck_channels=args.sep_bottleneck_channels, sep_skip_channels=args.sep_skip_channels,
+    #     sep_kernel_size=args.sep_kernel_size, sep_num_blocks=args.sep_num_blocks, sep_num_layers=args.sep_num_layers,
+    #     dilated=args.dilated, separable=args.separable, causal=args.causal, sep_nonlinear=args.sep_nonlinear, sep_norm=args.sep_norm, mask_nonlinear=args.mask_nonlinear,
+    #     n_sources=args.n_sources
+    # )
     print("# Parameters: {}".format(model.num_parameters))
     loss_func = NegSISDR()
+    # loss_func = nn.MSELoss()
     optim_dict = {
         "adam": torch.optim.Adam,
         "sgd": torch.optim.SGD,
     }
-
+    optimizer = optim_dict[args.optimizer](model.parameters(), lr=args.lr)
     system = System(
         args=args,
         model=model,
+        optimizer=optimizer,
         loss_func=loss_func,
         train_loader=train_loader,
         val_loader=val_loader,
-        optimizer=optim_dict[args.optimizer],
+        # optimizer=optim_dict[args.optimizer],
     )
 
     callbacks = []
     checkpoint = ModelCheckpoint(
-        args.model_dir, monitor="val_loss", mode="min", save_top_k=5, verbose=True
+        args.model_dir, monitor="val_loss", mode="min", save_top_k=1, verbose=True
     )
     callbacks.append(checkpoint)
     if args.early_stop:
@@ -160,7 +169,7 @@ def main(args):
         accelerator=args.accelerator,
         strategy=args.strategy,
         devices=args.devices,
-        amp_backend="apex",
+        amp_backend="native",
         logger=tb_logger,
         callbacks=callbacks,
         fast_dev_run=args.fast_dev_run,
@@ -169,6 +178,9 @@ def main(args):
         limit_val_batches=args.limit_val_batches,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.max_norm,
+        resume_from_checkpoint=args.continue_from,
+        track_grad_norm=args.track_grad_norm,
+        precision=args.precision,
     )
     trainer.fit(system)
 
@@ -176,6 +188,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training of SepFormer")
 
+    parser.add_argument('--cfg', type=str)
     parser.add_argument('--train_csv_dir', type=str, default=None, help='Path for training dataset csv ROOT directory')
     parser.add_argument('--val_csv_dir', type=str, default=None, help='Path for validation dataset csv ROOT directory')
     parser.add_argument('--sample_rate', '-sr', type=int, default=16000, help='Sampling rate')
@@ -219,8 +232,23 @@ if __name__ == "__main__":
     parser.add_argument('--continue_from', type=str, default=None, help='Resume training')
     parser.add_argument('--use_cuda', type=int, default=1, help='0: Not use cuda, 1: Use cuda')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--track_grad_norm', type=int, default=-1, help='Track gradient p-norm. Default -1 without tracking.')
 
-    with open("teacher_model.json", "r") as f:
+    args = parser.parse_args()
+    with open(args.cfg, "r") as f:
         args = parser.parse_args(namespace=argparse.Namespace(**json.load(f)))
+
+    if not os.path.exists(args.exp_dir):
+        os.makedirs(args.exp_dir)
+    if not os.path.exists(args.model_dir):
+        os.makedirs(args.model_dir)
+    if not os.path.exists(args.log_dir):
+        os.makedirs(args.log_dir)
+    if not os.path.exists(args.config_dir):
+        os.makedirs(args.config_dir)
+
+    # with open(os.path.join(args.config_dir, "config.json"), "w") as f:
+    #     config = vars(args)
+    #     json.dump(config, f)
 
     main(args)
