@@ -6,16 +6,53 @@ sys.path.append("../src")
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from criterion.sdr import ClippedNegSISDR, NegSISDR
 # from models.sepformer import SepFormer
-from models.conv_tasnet import ConvTasNet
-from models.tse_sepformer import SepFormer
+# from models.conv_tasnet import ConvTasNet
+# from models.tse_sepformer import SepFormer
+from speechbrain.pretrained import SepformerSeparation as separator
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.seed import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from datasets import PTSEDataset
+from transformers import Wav2Vec2Model
+from speechbrain.lobes.models.dual_path import SepformerWrapper
 
+
+class STFTLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def get_magnitude(self, wave):
+        mag = torch.stft(
+            wave,
+            n_fft=2048,
+            hop_length=512,
+            window=torch.hann_window(2048, device=wave.device),
+        ).pow(2).sum(-1).pow(0.5)
+        return mag
+
+    def forward(self, y_hat, y):
+        y_hat_mag = self.get_magnitude(y_hat.squeeze(1))
+        y_mag = self.get_magnitude(y.squeeze(1))
+        return F.mse_loss(y_hat_mag, y_mag)
+
+class FeatureLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h").feature_extractor
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+    def forward(self, y_hat, y):
+        y_hat_out = self.model(y_hat.squeeze(1))
+        y_out = self.model(y.squeeze(1))
+        y_hat_feat = y_hat_out.flatten(0, 1)
+        y_feat = y_out.flatten(0, 1)
+        feature_loss = F.mse_loss(y_hat_feat, y_feat)
+        return feature_loss
 
 class System(pl.LightningModule):
     def __init__(
@@ -39,17 +76,20 @@ class System(pl.LightningModule):
     def train_dataloader(self):
         return self.train_loader
 
-    def val_dataloader(self):
-        return self.val_loader
+    # def val_dataloader(self):
+    #     return self.val_loader
 
     def forward(self, batch):
         x, e = batch["noisy"], batch["spk_emb"]
         return self.model(x, e)
 
     def training_step(self, batch, batch_idx):
-        y, x, e = batch["clean_wave"], batch["noisy_wave"], batch["spk_emb"]
-        # y_hat = self.model(x)
-        y_hat = self.model(x, e)
+        y, x, e = batch["clean_wave"].squeeze(1), batch["noisy_wave"].squeeze(1), batch["enrol_wave"].squeeze(1)
+        x = torch.cat([e, x], dim=-1).squeeze(1)
+        y_hat = self.model(x)
+        y_hat = y_hat.squeeze(-1)
+        y_hat = y_hat[..., args.seg_len * args.sample_rate:]
+        # y_hat = self.model(x, e)
         loss = self.loss_func(y_hat, y)
         self.log(
             "train_loss", loss, 
@@ -57,15 +97,15 @@ class System(pl.LightningModule):
         )
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        y, x, e = batch["clean_wave"], batch["noisy_wave"], batch["spk_emb"]
-        # y_hat = self.model(x)
-        y_hat = self.model(x, e)
-        loss = self.loss_func(y_hat, y)
-        self.log(
-            "val_loss", loss, 
-            on_epoch=True, logger=True, sync_dist=True
-        )
+    # def validation_step(self, batch, batch_idx):
+    #     y, x, e = batch["clean_wave"], batch["noisy_wave"], batch["spk_emb"]
+    #     # y_hat = self.model(x)
+    #     y_hat = self.model(x, e)
+    #     loss = self.loss_func(y_hat, y)
+    #     self.log(
+    #         "val_loss", loss, 
+    #         on_epoch=True, logger=True, sync_dist=True
+    #     )
 
     def configure_optimizers(self):
         # optimizer = self.optimizer(self.model.parameters(), lr=self.args.lr)
@@ -77,7 +117,7 @@ class System(pl.LightningModule):
                 "optimizer": self.optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "val_loss",
+                    "monitor": "train_loss",
                     "frequency": 1,
                     "interval": "epoch",
                     "strict": True,
@@ -116,21 +156,47 @@ def main(args):
         pin_memory=args.pin_memory,
         drop_last=True,
     )
-
-    model = SepFormer(
-        args.n_basis, args.kernel_size, stride=args.stride,
-        enc_basis=args.enc_basis, dec_basis=args.dec_basis, enc_nonlinear=args.enc_nonlinear,
-        window_fn=args.window_fn, enc_onesided=args.enc_onesided, enc_return_complex=args.enc_return_complex,
-        sep_bottleneck_channels=args.sep_bottleneck_channels,
-        sep_chunk_size=args.sep_chunk_size, sep_hop_size=args.sep_hop_size,
-        sep_num_blocks=args.sep_num_blocks,
-        sep_num_layers_intra=args.sep_num_layers_intra, sep_num_layers_inter=args.sep_num_layers_inter,
-        sep_num_heads_intra=args.sep_num_heads_intra, sep_num_heads_inter=args.sep_num_heads_inter,
-        sep_d_ff_intra=args.sep_d_ff_intra, sep_d_ff_inter=args.sep_d_ff_inter,
-        sep_norm=args.sep_norm, sep_nonlinear=args.sep_nonlinear, sep_dropout=args.sep_dropout, mask_nonlinear=args.mask_nonlinear,
-        causal=args.causal,
-        n_sources=args.n_sources,
+    model = SepformerWrapper(
+        encoder_kernel_size=args.kernel_size,
+        encoder_in_nchannels=1,
+        encoder_out_nchannels=args.sep_bottleneck_channels,
+        masknet_chunksize=args.sep_chunk_size,
+        masknet_numlayers=args.sep_num_blocks,
+        masknet_norm="ln",
+        masknet_useextralinearlayer=False,
+        masknet_extraskipconnection=True,
+        masknet_numspks=1,
+        intra_numlayers=args.sep_num_layers_intra,
+        inter_numlayers=args.sep_num_layers_inter,
+        intra_nhead=args.sep_num_heads_intra,
+        inter_nhead=args.sep_num_heads_inter,
+        intra_dffn=args.sep_d_ff_intra,
+        inter_dffn=args.sep_d_ff_inter,
+        intra_use_positional=True,
+        inter_use_positional=True,
+        intra_norm_before=True,
+        inter_norm_before=True,
     )
+    # model = separator.from_hparams(
+    #     source="speechbrain/sepformer-wham16k-enhancement", 
+    #     freeze_params=False,
+    #     # savedir="pretrained_models/sepformer-wham16k-enhancement"
+    # )
+    # model = SepFormer.build_from_pretrained(task="wsj0-mix", sample_rate=8000, n_sources=2)
+    # model = SepFormer(
+    #     args.n_basis, args.kernel_size, stride=args.stride,
+    #     enc_basis=args.enc_basis, dec_basis=args.dec_basis, enc_nonlinear=args.enc_nonlinear,
+    #     window_fn=args.window_fn, enc_onesided=args.enc_onesided, enc_return_complex=args.enc_return_complex,
+    #     sep_bottleneck_channels=args.sep_bottleneck_channels,
+    #     sep_chunk_size=args.sep_chunk_size, sep_hop_size=args.sep_hop_size,
+    #     sep_num_blocks=args.sep_num_blocks,
+    #     sep_num_layers_intra=args.sep_num_layers_intra, sep_num_layers_inter=args.sep_num_layers_inter,
+    #     sep_num_heads_intra=args.sep_num_heads_intra, sep_num_heads_inter=args.sep_num_heads_inter,
+    #     sep_d_ff_intra=args.sep_d_ff_intra, sep_d_ff_inter=args.sep_d_ff_inter,
+    #     sep_norm=args.sep_norm, sep_nonlinear=args.sep_nonlinear, sep_dropout=args.sep_dropout, mask_nonlinear=args.mask_nonlinear,
+    #     causal=args.causal,
+    #     n_sources=args.n_sources,
+    # )
     # model = ConvTasNet(
     #     args.n_basis, args.kernel_size, stride=args.stride, enc_basis=args.enc_basis, dec_basis=args.dec_basis, enc_nonlinear=args.enc_nonlinear,
     #     window_fn=args.window_fn, enc_onesided=args.enc_onesided, enc_return_complex=args.enc_return_complex,
@@ -139,9 +205,10 @@ def main(args):
     #     dilated=args.dilated, separable=args.separable, causal=args.causal, sep_nonlinear=args.sep_nonlinear, sep_norm=args.sep_norm, mask_nonlinear=args.mask_nonlinear,
     #     n_sources=args.n_sources
     # )
-    print("# Parameters: {}".format(model.num_parameters))
     loss_func = NegSISDR()
+    # loss_func = STFTLoss()
     # loss_func = nn.MSELoss()
+    # loss_func = FeatureLoss()
     optim_dict = {
         "adam": torch.optim.Adam,
         "sgd": torch.optim.SGD,
@@ -159,11 +226,11 @@ def main(args):
 
     callbacks = []
     checkpoint = ModelCheckpoint(
-        args.model_dir, monitor="val_loss", mode="min", save_top_k=1, verbose=True
+        args.model_dir, monitor="train_loss", mode="min", save_top_k=1, verbose=True
     )
     callbacks.append(checkpoint)
     if args.early_stop:
-        callbacks.append(EarlyStopping(monitor="val_loss", mode="min", patience=args.patience, verbose=True))
+        callbacks.append(EarlyStopping(monitor="train_loss", mode="min", patience=args.patience, verbose=True))
     tb_logger = pl.loggers.TensorBoardLogger(save_dir=args.log_dir)
     trainer = pl.Trainer(
         accelerator=args.accelerator,

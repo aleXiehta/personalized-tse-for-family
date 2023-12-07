@@ -1,7 +1,7 @@
 {
-  "train_csv_dir": "../../pdns_training_set/train.csv",
+  "train_csv_dir": "../../pdns_training_set/train_aligned.csv",
   "val_csv_dir": "../../pdns_training_set/validation.csv",
-  "sample_rate": 16000,
+  "sample_rate": 8000,
   "seg_len": 1,
   "enc_basis": "trainable",
   "dec_basis": "trainable",
@@ -33,7 +33,7 @@
   "optimizer": "adam",
   "lr": 0.00015,
   "weight_decay": 0,
-  "max_norm": 0.5,
+  "max_norm": 5,
   "batch_size": 8,
   "epochs": 100,
   "exp_dir": "./exp",
