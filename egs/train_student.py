@@ -87,8 +87,7 @@ class System(pl.LightningModule):
         y, x, e = batch["clean_wave"].squeeze(1), batch["noisy_wave"].squeeze(1), batch["enrol_wave"].squeeze(1)
         x = torch.cat([e, x], dim=-1).squeeze(1)
         y_hat = self.model(x)
-        # y_hat = y_hat.squeeze(-1)
-        y_hat = y_hat[..., 0]
+        y_hat = y_hat.squeeze(-1)
         y_hat = y_hat[..., args.seg_len * args.sample_rate:]
         # y_hat = self.model(x, e)
         loss = self.loss_func(y_hat, y)
@@ -178,13 +177,8 @@ def main(args):
     #     intra_norm_before=True,
     #     inter_norm_before=True,
     # )
-    # model = separator.from_hparams(
-    #     source="speechbrain/sepformer-dns4-16k-enhancement", 
-    #     freeze_params=False,
-    #     # savedir="pretrained_models/sepformer-wham16k-enhancement"
-    # )
     model = separator.from_hparams(
-        source="speechbrain/resepformer-wsj02mix", 
+        source="speechbrain/sepformer-dns4-16k-enhancement", 
         freeze_params=False,
         # savedir="pretrained_models/sepformer-wham16k-enhancement"
     )

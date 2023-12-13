@@ -16,43 +16,10 @@ from speechbrain.pretrained import SepformerSeparation as separator
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.seed import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from datasets import PTSEDataset
+from datasets import PTSE_FT_Dataset
 from transformers import Wav2Vec2Model
 from speechbrain.lobes.models.dual_path import SepformerWrapper
 
-
-class STFTLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-    
-    def get_magnitude(self, wave):
-        mag = torch.stft(
-            wave,
-            n_fft=2048,
-            hop_length=512,
-            window=torch.hann_window(2048, device=wave.device),
-        ).pow(2).sum(-1).pow(0.5)
-        return mag
-
-    def forward(self, y_hat, y):
-        y_hat_mag = self.get_magnitude(y_hat.squeeze(1))
-        y_mag = self.get_magnitude(y.squeeze(1))
-        return F.mse_loss(y_hat_mag, y_mag)
-
-class FeatureLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h").feature_extractor
-        self.model.eval()
-        self.model.requires_grad_(False)
-
-    def forward(self, y_hat, y):
-        y_hat_out = self.model(y_hat.squeeze(1))
-        y_out = self.model(y.squeeze(1))
-        y_hat_feat = y_hat_out.flatten(0, 1)
-        y_feat = y_out.flatten(0, 1)
-        feature_loss = F.mse_loss(y_hat_feat, y_feat)
-        return feature_loss
 
 class System(pl.LightningModule):
     def __init__(
@@ -62,29 +29,29 @@ class System(pl.LightningModule):
             loss_func,
             optimizer,
             train_loader,
-            val_loader,
+            # test_loader,
         ):
         super().__init__()
         self.model = model
         self.loss_func = loss_func
         self.optimizer = optimizer
         self.train_loader = train_loader
-        self.val_loader = val_loader
+        # self.test_loader = test_loader
         self.args = args
         seed_everything(args.seed)
 
     def train_dataloader(self):
         return self.train_loader
 
-    # def val_dataloader(self):
-    #     return self.val_loader
+    def test_dataloader(self):
+        return self.test_loader
 
     def forward(self, batch):
         x, e = batch["noisy"], batch["spk_emb"]
         return self.model(x, e)
 
     def training_step(self, batch, batch_idx):
-        y, x, e = batch["clean_wave"].squeeze(1), batch["noisy_wave"].squeeze(1), batch["enrol_wave"].squeeze(1)
+        y, x, e = batch["pclean_wave"].squeeze(1), batch["noisy_wave"].squeeze(1), batch["enrol_wave"].squeeze(1)
         x = torch.cat([e, x], dim=-1).squeeze(1)
         y_hat = self.model(x)
         # y_hat = y_hat.squeeze(-1)
@@ -98,15 +65,15 @@ class System(pl.LightningModule):
         )
         return loss
 
-    # def validation_step(self, batch, batch_idx):
-    #     y, x, e = batch["clean_wave"], batch["noisy_wave"], batch["spk_emb"]
-    #     # y_hat = self.model(x)
-    #     y_hat = self.model(x, e)
+    # def test_step(self, batch, batch_idx):
+    #     y, x, e = batch["pclean_wave"].squeeze(1), batch["noisy_wave"].squeeze(1), batch["enrol_wave"].squeeze(1)
+    #     c = batch["clean"].squeeze(1)
+    #     x = torch.cat([e, x], dim=-1).squeeze(1)
+    #     y_hat = self.model(x)
+    #     y_hat = y_hat[..., 0]
+    #     y_hat = y_hat[..., args.seg_len * args.sample_rate:]
     #     loss = self.loss_func(y_hat, y)
-    #     self.log(
-    #         "val_loss", loss, 
-    #         on_epoch=True, logger=True, sync_dist=True
-    #     )
+    #     return loss
 
     def configure_optimizers(self):
         # optimizer = self.optimizer(self.model.parameters(), lr=self.args.lr)
@@ -131,16 +98,18 @@ class System(pl.LightningModule):
 
 def main(args):
     
-    train_set = PTSEDataset(
+    train_set = PTSE_FT_Dataset(
         csv_dir=args.train_csv_dir,
         seg_len=args.seg_len,
         sample_rate=args.sample_rate,
+        finetune=True,
     )
-    val_set = PTSEDataset(
-        csv_dir=args.val_csv_dir,
-        seg_len=args.seg_len,
-        sample_rate=args.sample_rate,
-    )
+    # test_set = PTSE_FT_Dataset(
+    #     csv_dir=args.val_csv_dir,
+    #     seg_len=args.seg_len,
+    #     sample_rate=args.sample_rate,
+    #     finetune=False,
+    # )
     train_loader = DataLoader(
         train_set,
         shuffle=True,
@@ -149,14 +118,14 @@ def main(args):
         pin_memory=args.pin_memory,
         drop_last=True,
     )
-    val_loader = DataLoader(
-        val_set,
-        shuffle=False,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        drop_last=True,
-    )
+    # test_loader = DataLoader(
+    #     test_set,
+    #     shuffle=False,
+    #     batch_size=args.batch_size,
+    #     num_workers=args.num_workers,
+    #     pin_memory=args.pin_memory,
+    #     drop_last=True,
+    # )
     # model = SepformerWrapper(
     #     encoder_kernel_size=args.kernel_size,
     #     encoder_in_nchannels=1,
@@ -186,7 +155,6 @@ def main(args):
     model = separator.from_hparams(
         source="speechbrain/resepformer-wsj02mix", 
         freeze_params=False,
-        # savedir="pretrained_models/sepformer-wham16k-enhancement"
     )
     # model = SepFormer.build_from_pretrained(task="wsj0-mix", sample_rate=8000, n_sources=2)
     # model = SepFormer(
@@ -226,8 +194,7 @@ def main(args):
         optimizer=optimizer,
         loss_func=loss_func,
         train_loader=train_loader,
-        val_loader=val_loader,
-        # optimizer=optim_dict[args.optimizer],
+        # test_loader=test_loader,
     )
 
     callbacks = []
