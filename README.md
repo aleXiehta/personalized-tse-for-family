@@ -1,4 +1,4 @@
-# personalized-tse-for-family
+# E533 Project Code
 Personalized Target Speaker Extraction for Family
 
 # External Resources
